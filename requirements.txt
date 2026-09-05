@@ -12,3 +12,8 @@ opencv-python==4.10.0.84
 ultralytics>=8.3.0  # 8.2.x incompatible with PyTorch 2.6+ (weights_only=True default)
 requests==2.32.3
 numpy==1.26.4
+
+# --- Phase 3: Blockchain Audit Trail ---
+psycopg2-binary>=2.9.9
+web3>=7.0.0
+

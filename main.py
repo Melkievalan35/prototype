@@ -267,7 +267,7 @@ async def health_check() -> dict:
 @app.get("/", include_in_schema=False)
 async def dashboard() -> FileResponse:
     """Serve the Command & Control Dashboard frontend."""
-    return FileResponse("index.html", media_type="text/html")
+    return FileResponse("index_v2.html", media_type="text/html")
 
 
 @app.get("/app.js", include_in_schema=False)
@@ -277,3 +277,10 @@ async def dashboard_js() -> FileResponse:
     only /snapshots/ is mounted as a static directory.
     """
     return FileResponse("app.js", media_type="application/javascript")
+
+
+@app.get("/app_v2.js", include_in_schema=False)
+async def dashboard_js_v2() -> FileResponse:
+    """Serve the v2 dashboard JavaScript bundle."""
+    return FileResponse("app_v2.js", media_type="application/javascript")
+
