@@ -17,3 +17,6 @@ numpy==1.26.4
 psycopg2-binary>=2.9.9
 web3>=7.0.0
 
+# --- Phase 4: IoT Hardware Integration ---
+pyserial>=3.5
+
