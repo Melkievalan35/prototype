@@ -151,9 +151,9 @@ async def shutdown() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-SENDER_EMAIL = "melkiemarivalanb24cs@psnacet.edu.in"
-APP_PASSWORD = "bsposqsghtdyqdbm"
-RECEIVER_EMAIL = "melkievalan35@gmail.com"
+SENDER_EMAIL = " "
+APP_PASSWORD = " "
+RECEIVER_EMAIL = " "
 
 def send_escalation_email(camera_id: str, event_type: str, timestamp: datetime) -> None:
     """Synchronously sends an escalation email for critical events."""
