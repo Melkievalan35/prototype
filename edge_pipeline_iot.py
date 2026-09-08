@@ -26,6 +26,7 @@ torch.serialization.add_safe_globals([ultralytics.nn.tasks.DetectionModel])
 
 import base64
 import logging
+import math
 import time
 import json
 import os
@@ -51,6 +52,12 @@ log = logging.getLogger("ibvap.edge")
 # ---------------------------------------------------------------------------
 
 WAKE_DURATION_S: float = 5.0
+
+# Centroid-based loitering detection (independent of ByteTrack dwell-time check)
+LOITER_THRESHOLD_SECONDS: int   = 15    # seconds stationary before critical alert
+MOVEMENT_TOLERANCE_PIXELS: int  = 50    # pixel radius treated as "not moved"
+# { track_id: {"start_time": float, "centroid": (cx, cy), "alerted": bool} }
+loiter_tracker: dict = {}
 
 # Backend API — updated to 127.0.0.1 for explicit loopback
 API_ENDPOINT: str = "http://127.0.0.1:8000/api/events"
@@ -411,9 +418,9 @@ def draw_hud(
     intrusions = alert_counts.get(EVENT_INTRUSION, 0)
     loitering  = alert_counts.get(EVENT_LOITERING, 0)
     hud = (
-        f"IBVAP v2 | {CAMERA_ID} | FPS:{fps:.1f} | Frame:{frame_count} | "
-        f"Tracks:{len(objects)} | "
-        f"INTRUSIONS:{intrusions} | LOITERING:{loitering}"
+        f"{CAMERA_ID} | FPS:{fps:.1f} | Frm:{frame_count} | "
+        f"Trk:{len(objects)} | "
+        f"INTR:{intrusions} | LOIT:{loitering}"
     )
     cv2.putText(frame, hud, (8, 26),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1, cv2.LINE_AA)
@@ -502,6 +509,50 @@ def run_pipeline() -> None:
             # ── 4. Annotate frame ─────────────────────────────────────────────────
             annotate_frame(frame, objects, fence_polygon)
     
+            # ── 4b. Centroid-based loitering detection ────────────────────────────
+            for obj in objects:
+                if obj.class_id != 0:   # persons only
+                    continue
+                cx = (obj.x1 + obj.x2) / 2
+                cy = (obj.y1 + obj.y2) / 2
+                tid = obj.track_id
+                if tid not in loiter_tracker:
+                    loiter_tracker[tid] = {
+                        "start_time": time.time(),
+                        "centroid":   (cx, cy),
+                        "alerted":    False,
+                    }
+                else:
+                    entry = loiter_tracker[tid]
+                    dist  = math.hypot(cx - entry["centroid"][0], cy - entry["centroid"][1])
+                    if dist > MOVEMENT_TOLERANCE_PIXELS:
+                        # Person moved — reset tracker
+                        entry["start_time"] = time.time()
+                        entry["centroid"]   = (cx, cy)
+                        entry["alerted"]    = False
+                    else:
+                        elapsed = time.time() - entry["start_time"]
+                        if elapsed >= LOITER_THRESHOLD_SECONDS and not entry["alerted"]:
+                            entry["alerted"] = True
+                            log.warning(
+                                "CRITICAL LOITERING — track_id=%d stationary %.0fs",
+                                tid, elapsed,
+                            )
+                            try:
+                                session.post(
+                                    API_ENDPOINT,
+                                    json={
+                                        "camera_id":    CAMERA_ID,
+                                        "event_type":   "CRITICAL: LOITERING DETECTED",
+                                        "confidence":   round(obj.confidence, 6),
+                                        "bounding_box": obj.bounding_box,
+                                        "snapshot_b64": encode_snapshot(frame),
+                                    },
+                                    timeout=5,
+                                )
+                            except Exception as exc:
+                                log.error("Loiter alert POST failed: %s", exc)
+    
             # ── 5. Alert dispatch ─────────────────────────────────────────────────
             # Sort by event priority (INTRUSION first, then LOITERING, skip normals)
             actionable = [
@@ -535,6 +586,7 @@ def run_pipeline() -> None:
                 track_first_seen.pop(tid, None)
                 track_last_seen.pop(tid, None)
                 track_last_alert.pop(tid, None)
+                loiter_tracker.pop(tid, None)    # prune centroid-loiter state too
     
             # ── 7. FPS (per-window, resets each second) ───────────────────────────
             elapsed = now - fps_timer

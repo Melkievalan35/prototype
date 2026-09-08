@@ -12,13 +12,15 @@ Architecture:
 import base64
 import os
 import uuid
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import databases
 import sqlalchemy
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -149,6 +151,33 @@ async def shutdown() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+SENDER_EMAIL = "melkiemarivalanb24cs@psnacet.edu.in"
+APP_PASSWORD = "bsposqsghtdyqdbm"
+RECEIVER_EMAIL = "melkievalan35@gmail.com"
+
+def send_escalation_email(camera_id: str, event_type: str, timestamp: datetime) -> None:
+    """Synchronously sends an escalation email for critical events."""
+    subject = f"CRITICAL ALERT: {event_type} on {camera_id}"
+    body = (
+        f"Camera ID: {camera_id}\n"
+        f"Event: {event_type}\n"
+        f"Timestamp: {timestamp}\n\n"
+        "Immediate action is required."
+    )
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = RECEIVER_EMAIL
+    
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, APP_PASSWORD)
+            server.send_message(msg)
+            print(f"Escalation email sent for {event_type} on {camera_id}.")
+    except Exception as exc:
+        print(f"Failed to send email: {exc}")
+
 
 def _save_snapshot(b64_data: str, event_id: str) -> str:
     """
@@ -199,7 +228,7 @@ def _row_to_response(row: Any, base_url: str) -> EventResponse:
     summary="Ingest a new anomaly event from the edge pipeline",
     tags=["Events"],
 )
-async def ingest_event(payload: EventIngest) -> EventResponse:
+async def ingest_event(payload: EventIngest, background_tasks: BackgroundTasks) -> EventResponse:
     """
     Accept a JSON alert from an edge node:
       1. Decodes `snapshot_b64` and writes JPEG to disk.
@@ -226,6 +255,9 @@ async def ingest_event(payload: EventIngest) -> EventResponse:
             timestamp=now,
         )
     )
+
+    if "LOITERING" in payload.event_type.upper():
+        background_tasks.add_task(send_escalation_email, payload.camera_id, payload.event_type, now)
 
     base_url = "http://localhost:8000"
     return EventResponse(

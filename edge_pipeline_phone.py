@@ -23,6 +23,7 @@ torch.serialization.add_safe_globals([ultralytics.nn.tasks.DetectionModel])
 
 import base64
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -30,6 +31,10 @@ import cv2
 import numpy as np
 import requests
 from ultralytics import YOLO
+import easyocr
+import re
+
+reader = easyocr.Reader(['en'], gpu=True)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -84,6 +89,15 @@ SNAPSHOT_JPEG_QUALITY: int = 85
 
 # ── Reconnect delay on stream drop ───────────────────────────────────────────
 RECONNECT_DELAY_S: float = 2.0
+
+# Centroid-based loitering detection (position-aware, independent of dwell-time check)
+LOITER_THRESHOLD_SECONDS: int  = 10   # seconds stationary before critical alert
+MOVEMENT_TOLERANCE_PIXELS: int = 150   # pixel radius considered "not moved"
+# { track_id: {"start_time": float, "centroid": (cx, cy), "alerted": bool} }
+loiter_tracker: dict = {}
+
+loiter_count: int = 0
+intrusion_count: int = 0
 
 # COCO class IDs
 VEHICLE_CLASSES: set[int] = {2, 3, 5, 7}   # car, motorcycle, bus, truck
@@ -182,6 +196,7 @@ def load_model(weights: str) -> YOLO:
     """Load (or download) YOLOv8 weights. safe_globals fix already applied."""
     log.info("Loading model: %s", weights)
     model = YOLO(weights)
+    model.to('cuda')
     log.info("Model loaded — %d classes available", len(model.names))
     return model
 
@@ -223,6 +238,7 @@ def run_tracking(model: YOLO, frame: np.ndarray) -> list[TrackedObject]:
     """
     results = model.track(
         frame,
+        device=0,
         persist=True,
         tracker="bytetrack.yaml",
         verbose=False,
@@ -350,21 +366,19 @@ def draw_hud(
     h, w = frame.shape[:2]
 
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 40), (10, 10, 10), cv2.FILLED)
+    cv2.rectangle(overlay, (0, 0), (w, 55), (10, 10, 10), cv2.FILLED)
     cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
 
     conn_str  = "LIVE" if connected else "RECONNECTING..."
-    vehicles  = alert_counts.get(EVENT_VEHICLE, 0)
-    intrusions = alert_counts.get(EVENT_INTRUSION, 0)
-    loitering  = alert_counts.get(EVENT_LOITERING, 0)
+    track_count = len(objects)
 
-    hud = (
-        f"IBVAP | {CAMERA_ID} [{conn_str}] | "
-        f"FPS:{fps:.1f} | Frame:{frame_count} | Tracks:{len(objects)} | "
-        f"VEH:{vehicles} INTR:{intrusions} LOIT:{loitering}"
-    )
-    cv2.putText(frame, hud, (8, 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    line1 = f"IBVAP v2 | CAM-EDGE | FPS:{fps:.1f} | Frame:{frame_count}"
+    line2 = f"Tracks:{track_count} | INTRUSIONS:{intrusion_count} | LOITERING:{loiter_count}"
+
+    cv2.putText(frame, line1, (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, line2, (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 136), 1, cv2.LINE_AA)
 
     if low_light:
         cv2.putText(frame, "[CLAHE ENHANCED]", (w - 185, 26),
@@ -454,6 +468,9 @@ def run_pipeline() -> None:
     )
     log.info("Press 'q' in the OpenCV window to quit.")
 
+    WIN_NAME = f"IBVAP — Phone Node ({CAMERA_ID})  [q to quit]"
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+
     # ── Outer reconnect loop ──────────────────────────────────────────────────
     while True:
         cap       = open_stream(PHONE_URL)
@@ -487,6 +504,7 @@ def run_pipeline() -> None:
             if fence_polygon is None:
                 h, w    = frame.shape[:2]
                 fence_polygon = build_fence_polygon(w, h)
+                cv2.resizeWindow(WIN_NAME, w, h)   # snap window to actual stream size
                 log.info("Fence polygon built for %dx%d frame.", w, h)
 
             # ── 1. Low-light CLAHE enhancement ───────────────────────────────
@@ -508,6 +526,51 @@ def run_pipeline() -> None:
             # ── 4. Annotate ───────────────────────────────────────────────────
             annotate_frame(frame, objects, fence_polygon, low_light)
 
+            # ── 4b. Centroid-based loitering detection ─────────────────────────
+            for obj in objects:
+                cx = (obj.x1 + obj.x2) / 2
+                cy = (obj.y1 + obj.y2) / 2
+                tid = obj.track_id
+                if tid not in loiter_tracker:
+                    loiter_tracker[tid] = {
+                        "start_time": time.time(),
+                        "centroid":   (cx, cy),
+                        "alerted":    False,
+                        "ocr_scanned": False,
+                    }
+                else:
+                    entry = loiter_tracker[tid]
+                    dist  = math.hypot(cx - entry["centroid"][0], cy - entry["centroid"][1])
+                    if dist > MOVEMENT_TOLERANCE_PIXELS:
+                        entry["start_time"] = time.time()
+                        entry["centroid"]   = (cx, cy)
+                        entry["alerted"]    = False
+                    else:
+                        if obj.class_id == 0:    # persons only for loitering alert
+                            loiter_elapsed = time.time() - entry["start_time"]
+                            if loiter_elapsed >= LOITER_THRESHOLD_SECONDS and not entry["alerted"]:
+                                global loiter_count
+                                loiter_count += 1
+                                entry["alerted"] = True
+                                log.warning(
+                                    "CRITICAL LOITERING — track_id=%d stationary %.0fs",
+                                    tid, loiter_elapsed,
+                                )
+                                try:
+                                    session.post(
+                                        API_ENDPOINT,
+                                        json={
+                                            "camera_id":    CAMERA_ID,
+                                            "event_type":   "CRITICAL: LOITERING DETECTED",
+                                            "confidence":   round(obj.confidence, 6),
+                                            "bounding_box": obj.bounding_box,
+                                            "snapshot_b64": encode_snapshot(frame),
+                                        },
+                                        timeout=5,
+                                    )
+                                except Exception as exc:
+                                    log.error("Loiter alert POST failed: %s", exc)
+
             # ── 5. Alert dispatch ─────────────────────────────────────────────
             # Sort by priority — vehicles first, then intrusions, then loitering
             actionable = [
@@ -525,12 +588,40 @@ def run_pipeline() -> None:
                 if now - last_global_alert < GLOBAL_ALERT_GAP_S:
                     break
 
+                if obj.event_type in (EVENT_INTRUSION, EVENT_VEHICLE):
+                    tid = obj.track_id
+                    if tid in loiter_tracker and not loiter_tracker[tid].get("ocr_scanned", False):
+                        h_frame, w_frame = frame.shape[:2]
+                        w_obj = obj.x2 - obj.x1
+                        h_obj = obj.y2 - obj.y1
+                        
+                        x1_crop = int(obj.x1 + w_obj * 0.2)
+                        x2_crop = int(obj.x2 - w_obj * 0.2)
+                        y1_crop = int(obj.y1 + h_obj * 0.6)
+                        y2_crop = int(obj.y2)
+
+                        x1_crop, y1_crop = max(0, x1_crop), max(0, y1_crop)
+                        x2_crop, y2_crop = min(w_frame, x2_crop), min(h_frame, y2_crop)
+                        
+                        plate_crop = frame[y1_crop:y2_crop, x1_crop:x2_crop]
+                        if plate_crop.size > 0:
+                            ocr_results = reader.readtext(plate_crop)
+                            loiter_tracker[tid]["ocr_scanned"] = True
+                            for bbox, text, prob in ocr_results:
+                                cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+                                if len(cleaned) >= 4:  # Alphanumeric pattern match
+                                    obj.event_type = f"ANPR: PLATE DETECTED -> {cleaned}"
+                                    break
+
                 snapshot_b64 = encode_snapshot(frame)
                 if post_alert(session, obj, snapshot_b64):
                     track_last_alert[obj.track_id] = now
                     last_global_alert              = now
                     alert_counts[obj.event_type]   = \
                         alert_counts.get(obj.event_type, 0) + 1
+                    if obj.event_type == EVENT_INTRUSION:
+                        global intrusion_count
+                        intrusion_count += 1
                 break   # one alert per frame cycle
 
             # ── 6. Stale-track pruning ────────────────────────────────────────
@@ -542,6 +633,7 @@ def run_pipeline() -> None:
                 track_first_seen.pop(tid, None)
                 track_last_seen.pop(tid, None)
                 track_last_alert.pop(tid, None)
+                loiter_tracker.pop(tid, None)    # prune centroid-loiter state too
 
             # ── 7. FPS (sliding 1-second window) ─────────────────────────────
             elapsed = now - fps_timer
@@ -555,7 +647,7 @@ def run_pipeline() -> None:
                      alert_counts, low_light, connected)
 
             # ── 9. Display ────────────────────────────────────────────────────
-            cv2.imshow(f"IBVAP — Phone Node ({CAMERA_ID})  [q to quit]", frame)
+            cv2.imshow(WIN_NAME, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 log.info("Quit key pressed — shutting down.")
                 cap.release()
