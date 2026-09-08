@@ -124,6 +124,9 @@ app.add_middleware(
 # Mount /snapshots as a static route so the frontend can display images directly.
 app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOTS_DIR)), name="snapshots")
 
+# Mount /static to serve offline CSS, JS, and other local assets.
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle hooks

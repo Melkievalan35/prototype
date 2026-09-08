@@ -48,7 +48,7 @@ log = logging.getLogger("ibvap.phone_edge")
 # ── Phone stream ─────────────────────────────────────────────────────────────
 # Replace YOUR_PHONE_IP with your phone's IP (shown in the IP Webcam / DroidCam app).
 # Common port is 8080 (IP Webcam) or 4747 (DroidCam).
-PHONE_URL: str = "http://192.168.1.4:8080/video"
+PHONE_URL: str = "http://10.249.88.65:8080/video"
 
 # ── Identity ──────────────────────────────────────────────────────────────────
 CAMERA_ID: str = "BOP-Mobile-Patrol"

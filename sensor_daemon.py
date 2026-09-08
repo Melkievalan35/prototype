@@ -4,7 +4,7 @@ import json
 
 def main():
     # Instructing user to change 'COM3' to the ESP32's actual port
-    port = 'COM3'
+    port = 'COM7'
     baudrate = 115200
     
     try:
